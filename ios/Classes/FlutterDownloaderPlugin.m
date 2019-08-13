@@ -391,7 +391,7 @@
     NSMutableArray *results = [NSMutableArray new];
     for(NSArray *record in records) {
         NSDictionary *task = [self taskDictFromRecordArray:record];
-        NSLog(@"%@", task);
+        /* NSLog(@"%@", task); */
         [results addObject:task];
     }
     return results;
