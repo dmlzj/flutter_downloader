@@ -1,16 +1,16 @@
 package vn.hunghd.flutterdownloader;
 
 import android.annotation.SuppressLint;
-import android.app.Activity;
-import android.app.Application;
-import android.content.BroadcastReceiver;
+import android.content.ContentResolver;
+import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
-import android.os.Bundle;
-import androidx.core.app.NotificationManagerCompat;
-import androidx.localbroadcastmanager.content.LocalBroadcastManager;
+import android.content.SharedPreferences;
+import android.database.Cursor;
+import android.net.Uri;
+import android.provider.MediaStore;
 
+import androidx.core.app.NotificationManagerCompat;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -27,49 +27,58 @@ import androidx.work.NetworkType;
 import androidx.work.OneTimeWorkRequest;
 import androidx.work.WorkManager;
 import androidx.work.WorkRequest;
-import io.flutter.app.FlutterActivity;
+
+import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.PluginRegistry;
 
-public class FlutterDownloaderPlugin implements MethodCallHandler, Application.ActivityLifecycleCallbacks {
+public class FlutterDownloaderPlugin implements MethodCallHandler, FlutterPlugin {
     private static final String CHANNEL = "vn.hunghd/downloader";
     private static final String TAG = "flutter_download_task";
 
+    public static final String SHARED_PREFERENCES_KEY = "vn.hunghd.downloader.pref";
+    public static final String CALLBACK_DISPATCHER_HANDLE_KEY = "callback_dispatcher_handle_key";
+
+    private static FlutterDownloaderPlugin instance;
     private MethodChannel flutterChannel;
     private TaskDbHelper dbHelper;
     private TaskDao taskDao;
     private Context context;
-
-    private final BroadcastReceiver updateProcessEventReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            String id = intent.getStringExtra(DownloadWorker.EXTRA_ID);
-            int progress = intent.getIntExtra(DownloadWorker.EXTRA_PROGRESS, 0);
-            int status = intent.getIntExtra(DownloadWorker.EXTRA_STATUS, DownloadStatus.UNDEFINED);
-            sendUpdateProgress(id, status, progress);
-        }
-    };
-
-    private FlutterDownloaderPlugin(Context context, BinaryMessenger messenger) {
-        this.context = context;
-        flutterChannel = new MethodChannel(messenger, CHANNEL);
-        flutterChannel.setMethodCallHandler(this);
-        dbHelper = TaskDbHelper.getInstance(context);
-        taskDao = new TaskDao(dbHelper);
-    }
+    private long callbackHandle;
+    private int debugMode;
+    private final Object initializationLock = new Object();
 
     @SuppressLint("NewApi")
     public static void registerWith(PluginRegistry.Registrar registrar) {
-        final FlutterDownloaderPlugin plugin = new FlutterDownloaderPlugin(registrar.context(), registrar.messenger());
-        registrar.activity().getApplication().registerActivityLifecycleCallbacks(plugin);
+        if (instance == null) {
+            instance = new FlutterDownloaderPlugin();
+        }
+        instance.onAttachedToEngine(registrar.context(), registrar.messenger());
+    }
+
+    public void onAttachedToEngine(Context applicationContext, BinaryMessenger messenger) {
+        synchronized (initializationLock) {
+            if (flutterChannel != null) {
+                return;
+            }
+            this.context = applicationContext;
+            flutterChannel = new MethodChannel(messenger, CHANNEL);
+            flutterChannel.setMethodCallHandler(this);
+            dbHelper = TaskDbHelper.getInstance(context);
+            taskDao = new TaskDao(dbHelper);
+        }
     }
 
     @Override
     public void onMethodCall(MethodCall call, MethodChannel.Result result) {
-        if (call.method.equals("enqueue")) {
+        if (call.method.equals("initialize")) {
+            initialize(call, result);
+        } else if (call.method.equals("registerCallback")) {
+            registerCallback(call, result);
+        } else if (call.method.equals("enqueue")) {
             enqueue(call, result);
         } else if (call.method.equals("loadTasks")) {
             loadTasks(call, result);
@@ -89,49 +98,23 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
             open(call, result);
         } else if (call.method.equals("remove")) {
             remove(call, result);
-        }  else {
+        } else {
             result.notImplemented();
         }
     }
 
     @Override
-    public void onActivityCreated(Activity activity, Bundle bundle) {
-
+    public void onAttachedToEngine(FlutterPluginBinding binding) {
+        onAttachedToEngine(binding.getApplicationContext(), binding.getBinaryMessenger());
     }
 
     @Override
-    public void onActivityStarted(Activity activity) {
-        if (activity instanceof FlutterActivity) {
-            LocalBroadcastManager.getInstance(context).registerReceiver(updateProcessEventReceiver,
-                    new IntentFilter(DownloadWorker.UPDATE_PROCESS_EVENT));
+    public void onDetachedFromEngine(FlutterPluginBinding binding) {
+        context = null;
+        if (flutterChannel != null) {
+            flutterChannel.setMethodCallHandler(null);
+            flutterChannel = null;
         }
-    }
-
-    @Override
-    public void onActivityResumed(Activity activity) {
-
-    }
-
-    @Override
-    public void onActivityPaused(Activity activity) {
-
-    }
-
-    @Override
-    public void onActivityStopped(Activity activity) {
-        if (activity instanceof FlutterActivity) {
-            LocalBroadcastManager.getInstance(context).unregisterReceiver(updateProcessEventReceiver);
-        }
-    }
-
-    @Override
-    public void onActivitySaveInstanceState(Activity activity, Bundle bundle) {
-
-    }
-
-    @Override
-    public void onActivityDestroyed(Activity activity) {
-
     }
 
     private WorkRequest buildRequest(String url, String savedDir, String filename, String headers, boolean showNotification, boolean openFileFromNotification, boolean isResume, boolean requiresStorageNotLow) {
@@ -150,6 +133,8 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
                         .putBoolean(DownloadWorker.ARG_SHOW_NOTIFICATION, showNotification)
                         .putBoolean(DownloadWorker.ARG_OPEN_FILE_FROM_NOTIFICATION, openFileFromNotification)
                         .putBoolean(DownloadWorker.ARG_IS_RESUME, isResume)
+                        .putLong(DownloadWorker.ARG_CALLBACK_HANDLE, callbackHandle)
+                        .putBoolean(DownloadWorker.ARG_DEBUG, debugMode == 1)
                         .build()
                 )
                 .build();
@@ -164,6 +149,23 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
         flutterChannel.invokeMethod("updateProgress", args);
     }
 
+    private void initialize(MethodCall call, MethodChannel.Result result) {
+        List args = (List) call.arguments;
+        long callbackHandle = Long.parseLong(args.get(0).toString());
+        debugMode = Integer.parseInt(args.get(1).toString());
+
+        SharedPreferences pref = context.getSharedPreferences(SHARED_PREFERENCES_KEY, Context.MODE_PRIVATE);
+        pref.edit().putLong(CALLBACK_DISPATCHER_HANDLE_KEY, callbackHandle).apply();
+
+        result.success(null);
+    }
+
+    private void registerCallback(MethodCall call, MethodChannel.Result result) {
+        List args = (List) call.arguments;
+        callbackHandle = Long.parseLong(args.get(0).toString());
+        result.success(null);
+    }
+
     private void enqueue(MethodCall call, MethodChannel.Result result) {
         String url = call.argument("url");
         String savedDir = call.argument("saved_dir");
@@ -173,7 +175,7 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
         boolean openFileFromNotification = call.argument("open_file_from_notification");
         boolean requiresStorageNotLow = call.argument("requires_storage_not_low");
         WorkRequest request = buildRequest(url, savedDir, filename, headers, showNotification, openFileFromNotification, false, requiresStorageNotLow);
-        WorkManager.getInstance().enqueue(request);
+        WorkManager.getInstance(context).enqueue(request);
         String taskId = request.getId().toString();
         result.success(taskId);
         sendUpdateProgress(taskId, DownloadStatus.ENQUEUED, 0);
@@ -217,19 +219,19 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
 
     private void cancel(MethodCall call, MethodChannel.Result result) {
         String taskId = call.argument("task_id");
-        WorkManager.getInstance().cancelWorkById(UUID.fromString(taskId));
+        WorkManager.getInstance(context).cancelWorkById(UUID.fromString(taskId));
         result.success(null);
     }
 
     private void cancelAll(MethodCall call, MethodChannel.Result result) {
-        WorkManager.getInstance().cancelAllWorkByTag(TAG);
+        WorkManager.getInstance(context).cancelAllWorkByTag(TAG);
         result.success(null);
     }
 
     private void pause(MethodCall call, MethodChannel.Result result) {
         String taskId = call.argument("task_id");
         taskDao.updateTask(taskId, true);
-        WorkManager.getInstance().cancelWorkById(UUID.fromString(taskId));
+        WorkManager.getInstance(context).cancelWorkById(UUID.fromString(taskId));
         result.success(null);
     }
 
@@ -251,7 +253,7 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
                     result.success(newTaskId);
                     sendUpdateProgress(newTaskId, DownloadStatus.RUNNING, task.progress);
                     taskDao.updateTask(taskId, newTaskId, DownloadStatus.RUNNING, task.progress, false);
-                    WorkManager.getInstance().enqueue(request);
+                    WorkManager.getInstance(context).enqueue(request);
                 } else {
                     result.error("invalid_data", "not found partial downloaded data, this task cannot be resumed", null);
                 }
@@ -274,7 +276,7 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
                 result.success(newTaskId);
                 sendUpdateProgress(newTaskId, DownloadStatus.ENQUEUED, task.progress);
                 taskDao.updateTask(taskId, newTaskId, DownloadStatus.ENQUEUED, task.progress, false);
-                WorkManager.getInstance().enqueue(request);
+                WorkManager.getInstance(context).enqueue(request);
             } else {
                 result.error("invalid_status", "only failed and canceled task can be retried", null);
             }
@@ -295,8 +297,8 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
                     filename = fileURL.substring(fileURL.lastIndexOf("/") + 1, fileURL.length());
                 }
                 String saveFilePath = savedDir + File.separator + filename;
-                Intent intent = IntentUtils.getOpenFileIntent(context, saveFilePath, task.mimeType);
-                if (IntentUtils.validateIntent(context, intent)) {
+                Intent intent = IntentUtils.validatedFileIntent(context, saveFilePath, task.mimeType);
+                if (intent != null) {
                     context.startActivity(intent);
                     result.success(true);
                 } else {
@@ -316,7 +318,7 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
         DownloadTask task = taskDao.loadTask(taskId);
         if (task != null) {
             if (task.status == DownloadStatus.ENQUEUED || task.status == DownloadStatus.RUNNING) {
-                WorkManager.getInstance().cancelWorkById(UUID.fromString(taskId));
+                WorkManager.getInstance(context).cancelWorkById(UUID.fromString(taskId));
             }
             if (shouldDeleteContent) {
                 String filename = task.filename;
@@ -327,6 +329,7 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
                 String saveFilePath = task.savedDir + File.separator + filename;
                 File tempFile = new File(saveFilePath);
                 if (tempFile.exists()) {
+                    deleteFileInMediaStore(tempFile);
                     tempFile.delete();
                 }
             }
@@ -338,5 +341,43 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
         } else {
             result.error("invalid_task_id", "not found task corresponding to given task id", null);
         }
+    }
+
+    private void deleteFileInMediaStore(File file) {
+        // Set up the projection (we only need the ID)
+        String[] projection = {MediaStore.Images.Media._ID};
+
+        // Match on the file path
+        String imageSelection = MediaStore.Images.Media.DATA + " = ?";
+        String videoSelection = MediaStore.Video.Media.DATA + " = ?";
+        String[] selectionArgs = new String[]{file.getAbsolutePath()};
+
+        // Query for the ID of the media matching the file path
+        Uri imageQueryUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI;
+        Uri videoQueryUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI;
+
+        ContentResolver contentResolver = context.getContentResolver();
+
+        // search the file in image store first
+        Cursor imageCursor = contentResolver.query(imageQueryUri, projection, imageSelection, selectionArgs, null);
+        if (imageCursor != null && imageCursor.moveToFirst()) {
+            // We found the ID. Deleting the item via the content provider will also remove the file
+            long id = imageCursor.getLong(imageCursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID));
+            Uri deleteUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+            contentResolver.delete(deleteUri, null, null);
+        } else {
+            // File not found in image store DB, try to search in video store
+            Cursor videoCursor = contentResolver.query(imageQueryUri, projection, imageSelection, selectionArgs, null);
+            if (videoCursor != null && videoCursor.moveToFirst()) {
+                // We found the ID. Deleting the item via the content provider will also remove the file
+                long id = videoCursor.getLong(videoCursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID));
+                Uri deleteUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+                contentResolver.delete(deleteUri, null, null);
+            } else {
+                // can not find the file in media store DB at all
+            }
+            if (videoCursor != null) videoCursor.close();
+        }
+        if (imageCursor != null) imageCursor.close();
     }
 }

@@ -33,11 +33,16 @@
 
 @interface FlutterDownloaderPlugin()<NSURLSessionTaskDelegate, NSURLSessionDownloadDelegate, UIDocumentInteractionControllerDelegate>
 {
-    FlutterMethodChannel *_flutterChannel;
+    FlutterEngine *_headlessRunner;
+    FlutterMethodChannel *_mainChannel;
+    FlutterMethodChannel *_callbackChannel;
+    NSObject<FlutterPluginRegistrar> *_registrar;
     NSURLSession *_session;
     DBManager *_dbManager;
     NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById;
     NSString *_allFilesDownloadedMsg;
+    NSMutableArray *_eventQueue;
+    int64_t _callbackHandle;
 }
 
 @property(nonatomic, strong) dispatch_queue_t databaseQueue;
@@ -46,14 +51,28 @@
 
 @implementation FlutterDownloaderPlugin
 
+static FlutterPluginRegistrantCallback registerPlugins = nil;
+static BOOL initialized = NO;
+static BOOL debug = YES;
+
 @synthesize databaseQueue;
 
-- (instancetype)initWithBinaryMessenger: (NSObject<FlutterBinaryMessenger>*) messenger;
+- (instancetype)init:(NSObject<FlutterPluginRegistrar> *)registrar;
 {
     if (self = [super init]) {
-        _flutterChannel = [FlutterMethodChannel
+        _headlessRunner = [[FlutterEngine alloc] initWithName:@"FlutterDownloaderIsolate" project:nil allowHeadlessExecution:YES];
+        _registrar = registrar;
+
+        _mainChannel = [FlutterMethodChannel
                            methodChannelWithName:@"vn.hunghd/downloader"
-                           binaryMessenger:messenger];
+                           binaryMessenger:[registrar messenger]];
+        [registrar addMethodCallDelegate:self channel:_mainChannel];
+
+        _callbackChannel =
+        [FlutterMethodChannel methodChannelWithName:@"vn.hunghd/downloader_background"
+                                    binaryMessenger:[_headlessRunner binaryMessenger]];
+
+        _eventQueue = [[NSMutableArray alloc] init];
 
         NSBundle *frameworkBundle = [NSBundle bundleForClass:FlutterDownloaderPlugin.class];
 
@@ -61,7 +80,9 @@
         NSURL *bundleUrl = [[frameworkBundle resourceURL] URLByAppendingPathComponent:@"FlutterDownloaderDatabase.bundle"];
         NSBundle *resourceBundle = [NSBundle bundleWithURL:bundleUrl];
         NSString *dbPath = [resourceBundle pathForResource:@"download_tasks" ofType:@"sql"];
-        NSLog(@"database path: %@", dbPath);
+        if (debug) {
+            NSLog(@"database path: %@", dbPath);
+        }
         databaseQueue = dispatch_queue_create("vn.hunghd.flutter_downloader", 0);
         _dbManager = [[DBManager alloc] initWithDatabaseFilePath:dbPath];
         _runningTaskById = [[NSMutableDictionary alloc] init];
@@ -72,24 +93,49 @@
         if (maxConcurrentTasks == nil) {
             maxConcurrentTasks = @3;
         }
-        NSLog(@"MAXIMUM_CONCURRENT_TASKS = %@", maxConcurrentTasks);
+        if (debug) {
+            NSLog(@"MAXIMUM_CONCURRENT_TASKS = %@", maxConcurrentTasks);
+        }
         NSURLSessionConfiguration *sessionConfiguration = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:[NSString stringWithFormat:@"%@.download.background.%f", NSBundle.mainBundle.bundleIdentifier, [[NSDate date] timeIntervalSince1970]]];
         sessionConfiguration.HTTPMaximumConnectionsPerHost = [maxConcurrentTasks intValue];
         _session = [NSURLSession sessionWithConfiguration:sessionConfiguration delegate:self delegateQueue:nil];
-        NSLog(@"init NSURLSession with id: %@", [[_session configuration] identifier]);
+        if (debug) {
+            NSLog(@"init NSURLSession with id: %@", [[_session configuration] identifier]);
+        }
 
         _allFilesDownloadedMsg = [mainBundle objectForInfoDictionaryKey:@"FDAllFilesDownloadedMessage"];
         if (_allFilesDownloadedMsg == nil) {
             _allFilesDownloadedMsg = @"All files have been downloaded";
         }
-        NSLog(@"AllFilesDownloadedMessage: %@", _allFilesDownloadedMsg);
+        if (debug) {
+            NSLog(@"AllFilesDownloadedMessage: %@", _allFilesDownloadedMsg);
+        }
     }
 
     return self;
 }
 
--(FlutterMethodChannel *)channel {
-    return _flutterChannel;
+- (void)startBackgroundIsolate:(int64_t)handle {
+    if (debug) {
+        NSLog(@"startBackgroundIsolate");
+    }
+    FlutterCallbackInformation *info = [FlutterCallbackCache lookupCallbackInformation:handle];
+    NSAssert(info != nil, @"failed to find callback");
+    NSString *entrypoint = info.callbackName;
+    NSString *uri = info.callbackLibraryPath;
+    [_headlessRunner runWithEntrypoint:entrypoint libraryURI:uri];
+    NSAssert(registerPlugins != nil, @"failed to set registerPlugins");
+
+    // Once our headless runner has been started, we need to register the application's plugins
+    // with the runner in order for them to work on the background isolate. `registerPlugins` is
+    // a callback set from AppDelegate.m in the main application. This callback should register
+    // all relevant plugins (excluding those which require UI).
+    registerPlugins(_headlessRunner);
+    [_registrar addMethodCallDelegate:self channel:_callbackChannel];
+}
+
+- (FlutterMethodChannel *)channel {
+    return _mainChannel;
 }
 
 - (NSURLSession*)currentSession {
@@ -106,7 +152,9 @@
 
         for (NSString *key in json) {
             NSString *value = json[key];
-            NSLog(@"Header(%@: %@)", key, value);
+            if (debug) {
+                NSLog(@"Header(%@: %@)", key, value);
+            }
             [request setValue:value forHTTPHeaderField:key];
         }
     }
@@ -116,12 +164,12 @@
     return task;
 }
 
-- (NSString*)identifierForTask:(NSURLSessionDownloadTask*) task
+- (NSString*)identifierForTask:(NSURLSessionTask*) task
 {
     return [NSString stringWithFormat: @"%@.%lu", [[[self currentSession] configuration] identifier], [task taskIdentifier]];
 }
 
-- (NSString*)identifierForTask:(NSURLSessionDownloadTask*) task ofSession:(NSURLSession *)session
+- (NSString*)identifierForTask:(NSURLSessionTask*) task ofSession:(NSURLSession *)session
 {
     return [NSString stringWithFormat: @"%@.%lu", [[session configuration] identifier], [task taskIdentifier]];
 }
@@ -134,7 +182,9 @@
 
 - (void)pauseTaskWithId: (NSString*)taskId
 {
-    NSLog(@"pause task with id: %@", taskId);
+    if (debug) {
+        NSLog(@"pause task with id: %@", taskId);
+    }
     __typeof__(self) __weak weakSelf = self;
     [[self currentSession] getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data, NSArray<NSURLSessionUploadTask *> *uploads, NSArray<NSURLSessionDownloadTask *> *downloads) {
         for (NSURLSessionDownloadTask *download in downloads) {
@@ -155,11 +205,13 @@
                     }
 
                     BOOL success = [resumeData writeToURL:destinationURL atomically:YES];
-                    NSLog(@"save partial downloaded data to a file: %s", success ? "success" : "failure");
+                    if (debug) {
+                        NSLog(@"save partial downloaded data to a file: %s", success ? "success" : "failure");
+                    }
                 }];
 
                 [weakSelf updateRunningTaskById:taskId progress:progress status:STATUS_PAUSED resumable:YES];
-                
+
                 [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_PAUSED) andProgress:@(progress)];
 
                 dispatch_sync([weakSelf databaseQueue], ^{
@@ -173,7 +225,9 @@
 
 - (void)cancelTaskWithId: (NSString*)taskId
 {
-    NSLog(@"cancel task with id: %@", taskId);
+    if (debug) {
+        NSLog(@"cancel task with id: %@", taskId);
+    }
     __typeof__(self) __weak weakSelf = self;
     [[self currentSession] getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data, NSArray<NSURLSessionUploadTask *> *uploads, NSArray<NSURLSessionDownloadTask *> *downloads) {
         for (NSURLSessionDownloadTask *download in downloads) {
@@ -210,20 +264,26 @@
 
 - (void)sendUpdateProgressForTaskId: (NSString*)taskId inStatus: (NSNumber*) status andProgress: (NSNumber*) progress
 {
-    NSDictionary *info = @{KEY_TASK_ID: taskId,
-                           KEY_STATUS: status,
-                           KEY_PROGRESS: progress};
-    [_flutterChannel invokeMethod:@"updateProgress" arguments:info];
+    NSArray *args = @[@(_callbackHandle), taskId, status, progress];
+    if (initialized) {
+        [_callbackChannel invokeMethod:@"" arguments:args];
+    } else {
+        [_eventQueue addObject:args];
+    }
 }
 
 - (BOOL)openDocumentWithURL:(NSURL*)url {
-    NSLog(@"try to open file in url: %@", url);
+    if (debug) {
+        NSLog(@"try to open file in url: %@", url);
+    }
     BOOL result = NO;
     UIDocumentInteractionController* tmpDocController = [UIDocumentInteractionController
                                                          interactionControllerWithURL:url];
     if (tmpDocController)
     {
-        NSLog(@"initialize UIDocumentInteractionController successfully");
+        if (debug) {
+            NSLog(@"initialize UIDocumentInteractionController successfully");
+        }
         tmpDocController.delegate = self;
         result = [tmpDocController presentPreviewAnimated:YES];
     }
@@ -232,11 +292,12 @@
 
 - (NSURL*)fileUrlFromDict:(NSDictionary*)dict
 {
-    NSString *url = dict[KEY_URL];
     NSString *savedDir = dict[KEY_SAVED_DIR];
     NSString *filename = dict[KEY_FILE_NAME];
-    NSLog(@"savedDir: %@", savedDir);
-    NSLog(@"filename: %@", filename);
+    if (debug) {
+        NSLog(@"savedDir: %@", savedDir);
+        NSLog(@"filename: %@", filename);
+    }
     NSURL *savedDirURL = [NSURL fileURLWithPath:savedDir];
     return [savedDirURL URLByAppendingPathComponent:filename];
 }
@@ -244,8 +305,10 @@
 - (NSURL*)fileUrlOf:(NSString*)taskId taskInfo:(NSDictionary*)taskInfo downloadTask:(NSURLSessionDownloadTask*)downloadTask {
     NSString *filename = taskInfo[KEY_FILE_NAME];
     NSString *suggestedFilename = downloadTask.response.suggestedFilename;
-    NSLog(@"SuggestedFileName: %@", suggestedFilename);
-    
+    if (debug) {
+        NSLog(@"SuggestedFileName: %@", suggestedFilename);
+    }
+
     // check filename, if it is empty then we try to extract it from http response or url path
     if (filename == (NSString*) [NSNull null] || [NULL_VALUE isEqualToString: filename]) {
         if (suggestedFilename) {
@@ -253,24 +316,24 @@
         } else {
             filename = downloadTask.currentRequest.URL.lastPathComponent;
         }
-        
+
         NSMutableDictionary *mutableTask = [taskInfo mutableCopy];
         [mutableTask setObject:filename forKey:KEY_FILE_NAME];
-        
+
         // update taskInfo
         if ([_runningTaskById objectForKey:taskId]) {
             _runningTaskById[taskId][KEY_FILE_NAME] = filename;
         }
-        
+
         // update DB
         __typeof__(self) __weak weakSelf = self;
         dispatch_sync(databaseQueue, ^{
             [weakSelf updateTask:taskId filename:filename];
         });
-        
+
         return [self fileUrlFromDict:mutableTask];
     }
-    
+
     return [self fileUrlFromDict:taskInfo];
 }
 
@@ -279,7 +342,9 @@
 }
 
 - (NSString*)shortenSavedDirPath:(NSString*)absolutePath {
-    NSLog(@"Absolute savedDir path: %@", absolutePath);
+    if (debug) {
+        NSLog(@"Absolute savedDir path: %@", absolutePath);
+    }
     if (absolutePath) {
         NSString* documentDirPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
         NSRange foundRank = [absolutePath rangeOfString:documentDirPath];
@@ -291,9 +356,9 @@
     return absolutePath;
 }
 
-- (long)currentTimeInMilliseconds
+- (long long)currentTimeInMilliseconds
 {
-    return [[NSDate date] timeIntervalSince1970]*1000;
+    return (long long)([[NSDate date] timeIntervalSince1970]*1000);
 }
 
 # pragma mark - Database Accessing
@@ -312,12 +377,14 @@
 - (void) addNewTask: (NSString*) taskId url: (NSString*) url status: (int) status progress: (int) progress filename: (NSString*) filename savedDir: (NSString*) savedDir headers: (NSString*) headers resumable: (BOOL) resumable showNotification: (BOOL) showNotification openFileFromNotification: (BOOL) openFileFromNotification
 {
     headers = [self escape:headers revert:false];
-    NSString *query = [NSString stringWithFormat:@"INSERT INTO task (task_id,url,status,progress,file_name,saved_dir,headers,resumable,show_notification,open_file_from_notification,time_created) VALUES (\"%@\",\"%@\",%d,%d,\"%@\",\"%@\",\"%@\",%d,%d,%d,%ld)", taskId, url, status, progress, filename, savedDir, headers, resumable ? 1 : 0, showNotification ? 1 : 0, openFileFromNotification ? 1 : 0, [self currentTimeInMilliseconds]];
+    NSString *query = [NSString stringWithFormat:@"INSERT INTO task (task_id,url,status,progress,file_name,saved_dir,headers,resumable,show_notification,open_file_from_notification,time_created) VALUES (\"%@\",\"%@\",%d,%d,\"%@\",\"%@\",\"%@\",%d,%d,%d,%lld)", taskId, url, status, progress, filename, savedDir, headers, resumable ? 1 : 0, showNotification ? 1 : 0, openFileFromNotification ? 1 : 0, [self currentTimeInMilliseconds]];
     [_dbManager executeQuery:query];
-    if (_dbManager.affectedRows != 0) {
-        NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
-    } else {
-        NSLog(@"Could not execute the query.");
+    if (debug) {
+        if (_dbManager.affectedRows != 0) {
+            NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
+        } else {
+            NSLog(@"Could not execute the query.");
+        }
     }
 }
 
@@ -325,40 +392,48 @@
 {
     NSString *query = [NSString stringWithFormat:@"UPDATE task SET status=%d, progress=%d WHERE task_id=\"%@\"", status, progress, taskId];
     [_dbManager executeQuery:query];
-    if (_dbManager.affectedRows != 0) {
-        NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
-    } else {
-        NSLog(@"Could not execute the query.");
+    if (debug) {
+        if (_dbManager.affectedRows != 0) {
+            NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
+        } else {
+            NSLog(@"Could not execute the query.");
+        }
     }
 }
 
 - (void) updateTask: (NSString*) taskId filename: (NSString*) filename {
     NSString *query = [NSString stringWithFormat:@"UPDATE task SET file_name=\"%@\" WHERE task_id=\"%@\"", filename, taskId];
     [_dbManager executeQuery:query];
-    if (_dbManager.affectedRows != 0) {
-        NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
-    } else {
-        NSLog(@"Could not execute the query.");
+    if (debug) {
+        if (_dbManager.affectedRows != 0) {
+            NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
+        } else {
+            NSLog(@"Could not execute the query.");
+        }
     }
 }
 
 - (void) updateTask: (NSString*) taskId status: (int) status progress: (int) progress resumable: (BOOL) resumable {
     NSString *query = [NSString stringWithFormat:@"UPDATE task SET status=%d, progress=%d, resumable=%d WHERE task_id=\"%@\"", status, progress, resumable ? 1 : 0, taskId];
     [_dbManager executeQuery:query];
-    if (_dbManager.affectedRows != 0) {
-        NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
-    } else {
-        NSLog(@"Could not execute the query.");
+    if (debug) {
+        if (_dbManager.affectedRows != 0) {
+            NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
+        } else {
+            NSLog(@"Could not execute the query.");
+        }
     }
 }
 
 - (void) updateTask: (NSString*) currentTaskId newTaskId: (NSString*) newTaskId status: (int) status resumable: (BOOL) resumable {
-    NSString *query = [NSString stringWithFormat:@"UPDATE task SET task_id=\"%@\", status=%d, resumable=%d, time_created=%ld WHERE task_id=\"%@\"", newTaskId, status, resumable ? 1 : 0, [self currentTimeInMilliseconds], currentTaskId];
+    NSString *query = [NSString stringWithFormat:@"UPDATE task SET task_id=\"%@\", status=%d, resumable=%d, time_created=%lld WHERE task_id=\"%@\"", newTaskId, status, resumable ? 1 : 0, [self currentTimeInMilliseconds], currentTaskId];
     [_dbManager executeQuery:query];
-    if (_dbManager.affectedRows != 0) {
-        NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
-    } else {
-        NSLog(@"Could not execute the query.");
+    if (debug) {
+        if (_dbManager.affectedRows != 0) {
+            NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
+        } else {
+            NSLog(@"Could not execute the query.");
+        }
     }
 }
 
@@ -366,20 +441,24 @@
 {
     NSString *query = [NSString stringWithFormat:@"UPDATE task SET resumable=%d WHERE task_id=\"%@\"", resumable ? 1 : 0, taskId];
     [_dbManager executeQuery:query];
-    if (_dbManager.affectedRows != 0) {
-        NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
-    } else {
-        NSLog(@"Could not execute the query.");
+    if (debug) {
+        if (_dbManager.affectedRows != 0) {
+            NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
+        } else {
+            NSLog(@"Could not execute the query.");
+        }
     }
 }
 
 - (void) deleteTask: (NSString*) taskId {
     NSString *query = [NSString stringWithFormat:@"DELETE FROM task WHERE task_id=\"%@\"", taskId];
     [_dbManager executeQuery:query];
-    if (_dbManager.affectedRows != 0) {
-        NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
-    } else {
-        NSLog(@"Could not execute the query.");
+    if (debug) {
+        if (_dbManager.affectedRows != 0) {
+            NSLog(@"Query was executed successfully. Affected rows = %d", _dbManager.affectedRows);
+        } else {
+            NSLog(@"Could not execute the query.");
+        }
     }
 }
 
@@ -387,11 +466,16 @@
 {
     NSString *query = @"SELECT * FROM task";
     NSArray *records = [[NSArray alloc] initWithArray:[_dbManager loadDataFromDB:query]];
-    NSLog(@"Load tasks successfully");
+    if (debug) {
+        NSLog(@"Load tasks successfully");
+    }
     NSMutableArray *results = [NSMutableArray new];
     for(NSArray *record in records) {
         NSDictionary *task = [self taskDictFromRecordArray:record];
-        /* NSLog(@"%@", task); */
+
+        if (debug) {
+            NSLog(@"%@", task);
+        }
         [results addObject:task];
     }
     return results;
@@ -400,7 +484,9 @@
 - (NSArray*)loadTasksWithRawQuery: (NSString*)query
 {
     NSArray *records = [[NSArray alloc] initWithArray:[_dbManager loadDataFromDB:query]];
-    NSLog(@"Load tasks successfully");
+    if (debug) {
+        NSLog(@"Load tasks successfully");
+    }
     NSMutableArray *results = [NSMutableArray new];
     for(NSArray *record in records) {
         [results addObject:[self taskDictFromRecordArray:record]];
@@ -416,7 +502,9 @@
     } else {
         NSString *query = [NSString stringWithFormat:@"SELECT * FROM task WHERE task_id = \"%@\" ORDER BY id DESC LIMIT 1", taskId];
         NSArray *records = [[NSArray alloc] initWithArray:[_dbManager loadDataFromDB:query]];
-        NSLog(@"Load task successfully");
+        if (debug) {
+            NSLog(@"Load task successfully");
+        }
         if (records != nil && [records count] > 0) {
             NSArray *record = [records firstObject];
             NSDictionary *task = [self taskDictFromRecordArray:record];
@@ -448,6 +536,33 @@
 
 # pragma mark - FlutterDownloader
 
+- (void)initializeMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
+    NSArray *arguments = call.arguments;
+    debug = [arguments[1] boolValue];
+    _dbManager.debug = debug;
+    [self startBackgroundIsolate:[arguments[0] longLongValue]];
+    result([NSNull null]);
+}
+
+- (void)didInitializeDispatcherMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
+    @synchronized (self) {
+        initialized = YES;
+        //unqueue all pending download status events.
+        while ([_eventQueue count] > 0) {
+            NSArray* args = _eventQueue[0];
+            [_eventQueue removeObjectAtIndex:0];
+            [_callbackChannel invokeMethod:@"" arguments:args];
+        }
+    }
+    result([NSNull null]);
+}
+
+- (void)registerCallbackMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
+    NSArray *arguments = call.arguments;
+    _callbackHandle = [arguments[0] longLongValue];
+    result([NSNull null]);
+}
+
 - (void)enqueueMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     NSString *urlString = call.arguments[KEY_URL];
     NSString *savedDir = call.arguments[KEY_SAVED_DIR];
@@ -456,7 +571,7 @@
     NSString *headers = call.arguments[KEY_HEADERS];
     NSNumber *showNotification = call.arguments[KEY_SHOW_NOTIFICATION];
     NSNumber *openFileFromNotification = call.arguments[KEY_OPEN_FILE_FROM_NOTIFICATION];
-    
+
     NSURLSessionDownloadTask *task = [self downloadTaskWithURL:[NSURL URLWithString:urlString] fileName:fileName andSavedDir:savedDir andHeaders:headers];
 
     NSString *taskId = [self identifierForTask:task];
@@ -523,7 +638,9 @@
         if ([status intValue] == STATUS_PAUSED) {
             NSURL *partialFileURL = [self fileUrlFromDict:taskDict];
 
-            NSLog(@"Try to load resume data at url: %@", partialFileURL);
+            if (debug) {
+                NSLog(@"Try to load resume data at url: %@", partialFileURL);
+            }
 
             NSData *resumeData = [NSData dataWithContentsOfURL:partialFileURL];
 
@@ -643,21 +760,22 @@
                     }
                 };
             }];
-        } else {
-            [self deleteTask:taskId];
         }
+        [self deleteTask:taskId];
         if (shouldDeleteContent) {
             NSURL *destinationURL = [self fileUrlFromDict:taskDict];
-            
+
             NSError *error;
             NSFileManager *fileManager = [NSFileManager defaultManager];
-            
+
             if ([fileManager fileExistsAtPath:[destinationURL path]]) {
                 [fileManager removeItemAtURL:destinationURL error:&error];
-                if (error == nil) {
-                    NSLog(@"delete content file successfully");
-                } else {
-                    NSLog(@"cannot delete content file: %@", [error localizedDescription]);
+                if (debug) {
+                    if (error == nil) {
+                        NSLog(@"delete content file successfully");
+                    } else {
+                        NSLog(@"cannot delete content file: %@", [error localizedDescription]);
+                    }
                 }
             }
         }
@@ -670,15 +788,21 @@
 # pragma mark - FlutterPlugin
 
 + (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar>*)registrar {
+    [registrar addApplicationDelegate: [[FlutterDownloaderPlugin alloc] init:registrar]];
+}
 
-    FlutterDownloaderPlugin* instance = [[FlutterDownloaderPlugin alloc] initWithBinaryMessenger:registrar.messenger];
-    [registrar addMethodCallDelegate:instance channel:[instance channel]];
-    [registrar addApplicationDelegate: instance];
++ (void)setPluginRegistrantCallback:(FlutterPluginRegistrantCallback)callback {
+  registerPlugins = callback;
 }
 
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
-    NSLog(@"methodCallHandler: %@", call.method);
-    if ([@"enqueue" isEqualToString:call.method]) {
+    if ([@"initialize" isEqualToString:call.method]) {
+        [self initializeMethodCall:call result:result];
+    } else if ([@"didInitializeDispatcher" isEqualToString:call.method]) {
+        [self didInitializeDispatcherMethodCall:call result:result];
+    } else if ([@"registerCallback" isEqualToString:call.method]) {
+        [self registerCallbackMethodCall:call result:result];
+    } else if ([@"enqueue" isEqualToString:call.method]) {
         [self enqueueMethodCall:call result:result];
     } else if ([@"loadTasks" isEqualToString:call.method]) {
         [self loadTasksMethodCall:call result:result];
@@ -705,19 +829,22 @@
 
 - (BOOL)application:(UIApplication *)application handleEventsForBackgroundURLSession:(NSString *)identifier completionHandler:(void (^)(void))completionHandler {
     self.backgroundTransferCompletionHandler = completionHandler;
+    //TODO: setup background isolate in case the application is re-launched from background to handle download event
     return YES;
 }
 
 - (void)applicationWillTerminate:(nonnull UIApplication *)application
 {
-    NSLog(@"applicationWillTerminate:");
+    if (debug) {
+        NSLog(@"applicationWillTerminate:");
+    }
     for (NSString* key in _runningTaskById) {
         if ([_runningTaskById[key][KEY_STATUS] intValue] < STATUS_COMPLETE) {
             [self updateTask:key status:STATUS_CANCELED progress:-1];
         }
     }
     _session = nil;
-    _flutterChannel = nil;
+    _mainChannel = nil;
     _dbManager = nil;
     databaseQueue = nil;
     _runningTaskById = nil;
@@ -727,13 +854,19 @@
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 {
     if (totalBytesExpectedToWrite == NSURLSessionTransferSizeUnknown) {
-        NSLog(@"Unknown transfer size");
+        if (debug) {
+            NSLog(@"Unknown transfer size");
+        }
     } else {
         NSString *taskId = [self identifierForTask:downloadTask];
         int progress = round(totalBytesWritten * 100 / (double)totalBytesExpectedToWrite);
         NSNumber *lastProgress = _runningTaskById[taskId][KEY_PROGRESS];
         if (([lastProgress intValue] == 0 || (progress > [lastProgress intValue] + STEP_UPDATE) || progress == 100) && progress != [lastProgress intValue]) {
             [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_RUNNING) andProgress:@(progress)];
+            __typeof__(self) __weak weakSelf = self;
+            dispatch_sync(databaseQueue, ^{
+                [weakSelf updateTask:taskId status:STATUS_RUNNING progress:progress];
+            });
             _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
         }
     }
@@ -741,14 +874,16 @@
 
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didFinishDownloadingToURL:(NSURL *)location
 {
-    NSLog(@"URLSession:downloadTask:didFinishDownloadingToURL:");
-    
+    if (debug) {
+        NSLog(@"URLSession:downloadTask:didFinishDownloadingToURL:");
+    }
+
     NSString *taskId = [self identifierForTask:downloadTask ofSession:session];
     NSDictionary *task = [self loadTaskWithId:taskId];
     NSURL *destinationURL = [self fileUrlOf:taskId taskInfo:task downloadTask:downloadTask];
-    
+
     [_runningTaskById removeObjectForKey:taskId];
-    
+
     NSError *error;
     NSFileManager *fileManager = [NSFileManager defaultManager];
 
@@ -767,7 +902,9 @@
             [weakSelf updateTask:taskId status:STATUS_COMPLETE progress:100];
         });
     } else {
-        NSLog(@"Unable to copy temp file. Error: %@", [error localizedDescription]);
+        if (debug) {
+            NSLog(@"Unable to copy temp file. Error: %@", [error localizedDescription]);
+        }
         [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_FAILED) andProgress:@(-1)];
         dispatch_sync(databaseQueue, ^{
             [weakSelf updateTask:taskId status:STATUS_FAILED progress:-1];
@@ -777,13 +914,19 @@
 
 -(void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error
 {
-    NSLog(@"URLSession:task:didCompleteWithError:");
+    if (debug) {
+        NSLog(@"URLSession:task:didCompleteWithError:");
+    }
     NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *) task.response;
     long httpStatusCode = (long)[httpResponse statusCode];
-    NSLog(@"HTTP status code: %ld", httpStatusCode);
+    if (debug) {
+        NSLog(@"HTTP status code: %ld", httpStatusCode);
+    }
     bool isSuccess = (httpStatusCode >= 200 && httpStatusCode < 300);
     if (error != nil || !isSuccess) {
-        NSLog(@"Download completed with error: %@", error != nil ? [error localizedDescription] : @(httpStatusCode));
+        if (debug) {
+            NSLog(@"Download completed with error: %@", error != nil ? [error localizedDescription] : @(httpStatusCode));
+        }
         NSString *taskId = [self identifierForTask:task ofSession:session];
         NSDictionary *taskInfo = [self loadTaskWithId:taskId];
         NSNumber *resumable = taskInfo[KEY_RESUMABLE];
@@ -806,11 +949,15 @@
 
 -(void)URLSessionDidFinishEventsForBackgroundURLSession:(NSURLSession *)session
 {
-    NSLog(@"URLSessionDidFinishEventsForBackgroundURLSession:");
+    if (debug) {
+        NSLog(@"URLSessionDidFinishEventsForBackgroundURLSession:");
+    }
     // Check if all download tasks have been finished.
     [[self currentSession] getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
         if ([downloadTasks count] == 0) {
-            NSLog(@"all download tasks have been finished");
+            if (debug) {
+                NSLog(@"all download tasks have been finished");
+            }
 
             if (self.backgroundTransferCompletionHandler != nil) {
                 // Copy locally the completion handler.
@@ -825,7 +972,7 @@
 
                     // Show a local notification when all downloads are over.
                     UILocalNotification *localNotification = [[UILocalNotification alloc] init];
-                    localNotification.alertBody = _allFilesDownloadedMsg;
+                    localNotification.alertBody = self->_allFilesDownloadedMsg;
                     [[UIApplication sharedApplication] presentLocalNotificationNow:localNotification];
                 }];
             }
@@ -842,18 +989,24 @@
 
 - (void)documentInteractionController:(UIDocumentInteractionController *)controller willBeginSendingToApplication:(NSString *)application
 {
-    NSLog(@"Send the document to app %@  ...", application);
+    if (debug) {
+        NSLog(@"Send the document to app %@  ...", application);
+    }
 }
 
 - (void)documentInteractionController:(UIDocumentInteractionController *)controller didEndSendingToApplication:(NSString *)application
 {
-    NSLog(@"Finished sending the document to app %@  ...", application);
+    if (debug) {
+        NSLog(@"Finished sending the document to app %@  ...", application);
+    }
 
 }
 
 - (void)documentInteractionControllerDidDismissOpenInMenu:(UIDocumentInteractionController *)controller
 {
-    NSLog(@"Finished previewing the document");
+    if (debug) {
+        NSLog(@"Finished previewing the document");
+    }
 }
 
 @end
